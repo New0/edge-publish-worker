@@ -1,0 +1,39 @@
+{
+  // The edge side of a WordPress site, deployable in one click.
+  //
+  // Every binding below carries a default, because the Deploy to Cloudflare
+  // button reads this file to decide what to create. The ids are placeholders
+  // and are replaced with real ones when the resources are provisioned.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "edge-publish-site",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-10",
+
+  // The static site. Pages are written here by a full build; between builds the
+  // plugin pushes individual pages into PAGES_CACHE, which is served first.
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+
+  "kv_namespaces": [
+    { "binding": "PAGES_CACHE", "id": "0000000000000000000000000000000f" },
+    { "binding": "SEARCH_INDEX", "id": "0000000000000000000000000000000f" }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "edge-publish-site-db",
+      "database_id": "0000000000000000000000000000000f",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "vars": {
+    // The public address of this site. Used for CORS and to rewrite pages the
+    // plugin pushes. Change it to your domain.
+    "ALLOWED_ORIGIN": "https://example.com",
+    // Where WordPress lives now. Usually a subdomain of the same site.
+    "WP_SOURCE": "https://ia.example.com"
+  },
+
+  "observability": { "enabled": true }
+}

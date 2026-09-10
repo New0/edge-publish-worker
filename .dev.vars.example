@@ -1,0 +1,14 @@
+# Secrets. The Deploy button asks for each of these; `wrangler secret put NAME`
+# sets one afterwards. None of them belong in the repository.
+
+# Shared with the Edge Publish plugin. Generate a long random string and paste
+# the same value into the plugin's settings screen. It is what proves a publish
+# came from your WordPress and not from someone else.
+SYNC_SECRET="change-me-to-a-long-random-string"
+
+# Only if WordPress is behind HTTP Basic Auth, which is the recommended way to
+# keep the origin private. Base64 of "user:password".
+WP_BASIC_AUTH=""
+
+# Only if your forms use a Turnstile widget. Leave empty and Turnstile is off.
+TURNSTILE_SECRET_KEY=""
