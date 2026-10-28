@@ -11,13 +11,17 @@
  *   });
  */
 
+import { canWake, wakeWordPress } from '../lib/wake.js';
+import type { WpFetchEnv } from '../lib/wp-fetch.js';
 import { isAllowedOrigin, getResponseOrigin, corsHeaders } from '../lib/cors.js';
 import { validateTurnstile } from '../lib/turnstile.js';
 import { sanitize, isValidEmail } from '../lib/escape.js';
+import { readJsonObject, text, withReplayableBody } from '../lib/body.js';
 import { resolveMessages, type MessageSource } from '../lib/messages.js';
 
 export interface ContactEnv {
   DB: D1Database;
+  /** The site's origin, or several comma-separated (lib/cors.ts). */
   ALLOWED_ORIGIN: string;
   PAGES_PROJECT?: string;
   TURNSTILE_SECRET_KEY?: string;
@@ -49,6 +53,12 @@ export interface ContactOptions {
   maxName?: number;
   maxEmail?: number;
   maxMessage?: number;
+  /**
+   * Whole request body, in bytes. Well above anything the field limits let
+   * through, which still truncate rather than refuse: this is the ceiling on
+   * what the Worker reads at all, not a limit a visitor can meet by typing.
+   */
+  maxBodyBytes?: number;
   /** Called after a successful insert, for email or other side effects. */
   onStored?: (
     record: { name: string; email: string; message: string },
@@ -58,7 +68,7 @@ export interface ContactOptions {
 
 const DEFAULTS = {
   rateLimit: 3, maxName: 100, maxEmail: 254, maxMessage: 5000,
-  dedupeWindowMs: 120_000,
+  dedupeWindowMs: 120_000, maxBodyBytes: 64 * 1024,
 };
 
 /** OPTIONS preflight. Shared by every site. */
@@ -77,6 +87,7 @@ export function createContactHandler(options: ContactOptions = {}): PagesFunctio
   const maxName = options.maxName ?? DEFAULTS.maxName;
   const maxEmail = options.maxEmail ?? DEFAULTS.maxEmail;
   const maxMessage = options.maxMessage ?? DEFAULTS.maxMessage;
+  const maxBody = options.maxBodyBytes ?? DEFAULTS.maxBodyBytes;
 
   return async (context) => {
     const configuredOrigin = context.env.ALLOWED_ORIGIN;
@@ -95,7 +106,19 @@ export function createContactHandler(options: ContactOptions = {}): PagesFunctio
     }
 
     try {
-      const body = (await context.request.json()) as ContactBody;
+      /*
+       * Read with a ceiling, and refuse what is not a JSON object with a 400.
+       * Until 2026-09-28 this was `request.json()`, unbounded, and `null` or
+       * `{"name": 1}` threw a TypeError further down: a 500 and an error log
+       * for every bot that sent one, burying the errors that are ours.
+       */
+      const read = await readJsonObject(context.request, maxBody);
+      if (!read.ok) {
+        return read.reason === 'too_large'
+          ? json({ error: t('tooLarge') }, 413)
+          : json({ error: t('genericError') }, 400);
+      }
+      const body = read.body;
       // Re-resolve now the body is available: a multilingual site picks its
       // language from a field in it.
       t = resolveMessages(options.messages, context.request, body);
@@ -107,7 +130,7 @@ export function createContactHandler(options: ContactOptions = {}): PagesFunctio
       // Turnstile, when configured. An unset secret disables it rather than
       // failing every submission — a site may not use Turnstile at all.
       if (context.env.TURNSTILE_SECRET_KEY) {
-        const token = body['cf-turnstile-response'] || '';
+        const token = text(body['cf-turnstile-response']);
         const ok = await validateTurnstile(
           token,
           context.env.TURNSTILE_SECRET_KEY,
@@ -116,28 +139,27 @@ export function createContactHandler(options: ContactOptions = {}): PagesFunctio
         if (!ok) return json({ error: t('antispamFailed') }, 400);
       }
 
-      if (!body.name?.trim() || !body.email?.trim() || !body.message?.trim()) {
+      // A field that is not text is a field not filled in.
+      const rawName = text(body.name);
+      const rawEmail = text(body.email).trim();
+      const rawMessage = text(body.message);
+      if (!rawName.trim() || !rawEmail || !rawMessage.trim()) {
         return json({ error: t('fieldsRequired'), required: ['name', 'email', 'message'] }, 400);
       }
-      if (!isValidEmail(body.email.trim())) {
+      if (!isValidEmail(rawEmail)) {
         return json({ error: t('invalidEmail') }, 400);
       }
 
-      const name = sanitize(body.name, maxName);
-      const email = body.email.trim().slice(0, maxEmail);
-      const message = sanitize(body.message, maxMessage);
+      const name = sanitize(rawName, maxName);
+      const email = rawEmail.slice(0, maxEmail);
+      const message = sanitize(rawMessage, maxMessage);
       const ip = context.request.headers.get('CF-Connecting-IP') || 'unknown';
       const userAgent = context.request.headers.get('User-Agent') || 'unknown';
 
-      const oneHourAgo = new Date(Date.now() - 3_600_000).toISOString();
-      const recent = await context.env.DB
-        .prepare('SELECT COUNT(*) as count FROM contact_submissions WHERE ip = ? AND submitted_at > ?')
-        .bind(ip, oneHourAgo)
-        .first<{ count: number }>();
-
-      if (recent && recent.count >= limit) {
-        return json({ error: t('rateLimited') }, 429);
-      }
+      const now = Date.now();
+      const submittedAt = new Date(now).toISOString();
+      const oneHourAgo = new Date(now - 3_600_000).toISOString();
+      const windowStart = new Date(now - dedupeWindow).toISOString();
 
       /*
        * Double-submit: report success without storing a second copy.
@@ -146,28 +168,71 @@ export function createContactHandler(options: ContactOptions = {}): PagesFunctio
        * and storing it would put duplicate enquiries in front of whoever
        * reads them. Same rule and same window as comment.ts — this is the
        * idempotency guarantee for a request nobody can retry deliberately.
+       *
+       * Checked before the hourly limit: a browser retrying the message that
+       * used the last of the allowance was told 429 about a message we hold.
        */
-      const windowStart = new Date(Date.now() - dedupeWindow).toISOString();
-      const duplicate = await context.env.DB
-        .prepare(
-          'SELECT COUNT(*) as count FROM contact_submissions ' +
-          'WHERE email = ? AND message = ? AND submitted_at > ?'
-        )
-        .bind(email, message, windowStart)
-        .first<{ count: number }>();
-      if (duplicate && duplicate.count > 0) {
+      const isDuplicate = async () => {
+        const hit = await context.env.DB
+          .prepare(
+            'SELECT COUNT(*) as count FROM contact_submissions ' +
+            'WHERE email = ? AND message = ? AND submitted_at > ?'
+          )
+          .bind(email, message, windowStart)
+          .first<{ count: number }>();
+        return Boolean(hit && hit.count > 0);
+      };
+      if (await isDuplicate()) {
         return json({ success: true, message: t('success') });
       }
 
-      // Column names are contractual with schema.sql: submitted_at, not
-      // timestamp. A test in src/tests/workers-endpoints.test.mjs pins this.
-      await context.env.DB
+      /*
+       * The limit and the duplicate rule are conditions of the INSERT itself,
+       * in one statement, so D1 decides both atomically. As a COUNT, then a
+       * SELECT, then an INSERT, every request in a burst read the same count
+       * before any of them wrote: fifty concurrent posts from one IP stored
+       * fifty rows against a limit of three, each waking WordPress.
+       *
+       * Column names are contractual with schema.sql: submitted_at, not
+       * timestamp. A test in src/tests/workers-contact.test.mjs pins this.
+       */
+      const inserted = await context.env.DB
         .prepare(
           'INSERT INTO contact_submissions (name, email, message, submitted_at, ip, user_agent) ' +
-          'VALUES (?, ?, ?, ?, ?, ?)'
+          'SELECT ?, ?, ?, ?, ?, ? ' +
+          'WHERE (SELECT COUNT(*) FROM contact_submissions WHERE ip = ? AND submitted_at > ?) < ? ' +
+          'AND NOT EXISTS (SELECT 1 FROM contact_submissions WHERE email = ? AND message = ? AND submitted_at > ?)'
         )
-        .bind(name, email, message, new Date().toISOString(), ip, userAgent)
+        .bind(
+          name, email, message, submittedAt, ip, userAgent,
+          ip, oneHourAgo, limit,
+          email, message, windowStart
+        )
         .run();
+
+      if (!inserted.meta?.changes) {
+        // Nothing stored: the hour's allowance is spent, or an identical copy
+        // landed between the check above and the insert — a double-click's
+        // twin. Only the second is the visitor's success.
+        return (await isDuplicate())
+          ? json({ success: true, message: t('success') })
+          : json({ error: t('rateLimited') }, 429);
+      }
+
+      // Into WordPress within the owner's interval: the plugin drains it, and
+      // WordPress mails the owner with its own wp_mail() — no mail service
+      // needed. After the answer, and never failing it (lib/wake.ts).
+      // WP_SOURCE and SYNC_SECRET are bindings every site's edge has (the
+      // sync endpoints need them); this handler's own env type does not name
+      // them, so they are read through WordPress's fetch type.
+      const wpEnv = context.env as unknown as WpFetchEnv;
+      if (canWake(wpEnv)) {
+        context.waitUntil(
+          wakeWordPress(wpEnv).then((outcome) => {
+            if (!outcome.woken) console.warn(`[contact] WordPress was not woken: ${outcome.reason}`);
+          })
+        );
+      }
 
       if (options.onStored) {
         // Side effects must not delay the response, and must not fail it.
@@ -176,7 +241,7 @@ export function createContactHandler(options: ContactOptions = {}): PagesFunctio
         // could catch it, and 500 a submission that was already stored.
         const stored = { name, email, message };
         context.waitUntil(
-          (async () => options.onStored!(stored, context))().catch((err) =>
+          (async () => options.onStored!(stored, withReplayableBody(context, read.raw)))().catch((err) =>
             console.error('[contact] onStored failed:', err)
           )
         );

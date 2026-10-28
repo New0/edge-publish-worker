@@ -29,6 +29,7 @@
 
 import { onRequest as middleware, type MiddlewareEnv } from './_middleware.js';
 import { createContactHandler, createContactOptionsHandler, type ContactEnv, type ContactOptions } from './api/contact.js';
+import { createFormHandler, createFormOptionsHandler, type FormEnv, type FormOptions } from './api/form.js';
 import {
   createCommentGetHandler,
   createCommentOptionsHandler,
@@ -55,17 +56,51 @@ import {
   createUpdateIndexOptionsHandler,
   type UpdateIndexEnv,
 } from './api/update-index.js';
+import { DEFAULT_SYNC_TYPES } from './lib/sync-types.js';
+// Commerce and customer accounts (docs/STRIPE-COMMERCE.md, docs/EDGE-ACCOUNTS.md).
+// A site that sells nothing binds no Stripe key, and every one of these
+// answers "this site does not sell anything yet" instead of failing.
+import { createCheckoutHandler, createCheckoutOptionsHandler, type CheckoutEnv } from './api/checkout.js';
+import { createStripeWebhookHandler, type StripeWebhookEnv } from './api/stripe-webhook.js';
+import { createProductsHandler, type ProductsEnv } from './api/products.js';
+import { createPortalHandler, createPortalOptionsHandler, type PortalEnv } from './api/portal.js';
+import { createAccountsHandler, type AccountsApiEnv } from './api/accounts.js';
+import {
+  createAccountRequestHandler,
+  createAccountVerifyHandler,
+  createAccountSignOutHandler,
+  createAccountMeHandler,
+  createAccountOrdersHandler,
+  createAccountOptionsHandler,
+  type AccountApiEnv,
+} from './api/account.js';
 import { createDefaultTransform } from './lib/default-transform.js';
+import { primaryOrigin } from './lib/cors.js';
 
 /** Everything the endpoints need, plus the static assets a Worker serves itself. */
 export interface WorkerEnv
   extends MiddlewareEnv,
     ContactEnv,
+    FormEnv,
     CommentEnv,
     SearchEnv,
     SyncEnv,
     UpdatePageEnv,
-    UpdateIndexEnv {
+    UpdateIndexEnv,
+    Omit<CheckoutEnv, 'DB'>,
+    ProductsEnv,
+    AccountsApiEnv,
+    /*
+     * `Omit` for the ones that declare as optional what another endpoint
+     * declares as required: TypeScript cannot merge `ALLOWED_ORIGIN?: string`
+     * with `ALLOWED_ORIGIN: string`, and the required spelling is the true one
+     * here — a Worker with no allowed origin serves nothing anyone can call.
+     * Likewise checkout's optional `DB`. The same reason `WpFetchEnv` exists
+     * separately (see lib/stripe.ts).
+     */
+    Omit<StripeWebhookEnv, 'ALLOWED_ORIGIN' | 'SYNC_SECRET'>,
+    Omit<AccountApiEnv, 'SYNC_SECRET'>,
+    PortalEnv {
   /** The static site, bound by `assets` in the Wrangler configuration. */
   ASSETS: Fetcher;
 }
@@ -78,23 +113,20 @@ export interface WorkerEnv
  */
 export interface SiteConfig {
   contact?: ContactOptions;
+  /** Any plugin's form, stored as one JSON record per submission. */
+  form?: FormOptions;
   comment?: CommentOptions;
   /**
    * Which record types the WordPress plugin may drain, and from which table.
    *
-   * Defaults to the two the shared schema creates. A site that adds a table
+   * Defaults to the three the shared schema creates. A site that adds a table
    * adds it here, and `sync.ts` refuses a name that is not a plain identifier.
    */
   sync?: SyncOptions;
   updatePage?: Omit<UpdatePageOptions, 'transform'> & Partial<Pick<UpdatePageOptions, 'transform'>>;
 }
 
-const DEFAULT_SYNC: SyncOptions = {
-  types: {
-    contact: { table: 'contact_submissions', timestampColumn: 'submitted_at' },
-    comment: { table: 'comments', timestampColumn: 'submitted_at' },
-  },
-};
+const DEFAULT_SYNC: SyncOptions = { types: DEFAULT_SYNC_TYPES };
 
 type AnyHandler = (context: EventContext<never, string, Record<string, unknown>>) => Response | Promise<Response>;
 
@@ -121,15 +153,22 @@ function asContext(request: Request, env: WorkerEnv, ctx: ExecutionContext, next
 /**
  * The Worker.
  *
- * Routes are exact paths rather than patterns: these six are the whole API
+ * Routes are exact paths rather than patterns: this table is the whole API
  * surface, and a prefix match would let `/api/contactenator` reach the contact
- * endpoint.
+ * endpoint. It must stay in step with what a Pages deployment generates
+ * (`src/deploy/pages-functions.mjs`); a test compares the two, because a site
+ * behind the Workers front door and a site on Pages are meant to be the same
+ * site.
  */
 export function createWorker(config: SiteConfig = {}): ExportedHandler<WorkerEnv> {
   const routes: Record<string, Partial<Record<string, AnyHandler>>> = {
     '/api/contact': {
       POST: createContactHandler(config.contact) as AnyHandler,
       OPTIONS: createContactOptionsHandler() as AnyHandler,
+    },
+    '/api/form': {
+      POST: createFormHandler(config.form) as AnyHandler,
+      OPTIONS: createFormOptionsHandler() as AnyHandler,
     },
     '/api/comment': {
       GET: createCommentGetHandler(config.comment) as AnyHandler,
@@ -149,7 +188,76 @@ export function createWorker(config: SiteConfig = {}): ExportedHandler<WorkerEnv
       POST: createUpdateIndexHandler() as AnyHandler,
       OPTIONS: createUpdateIndexOptionsHandler() as AnyHandler,
     },
+
+    // Commerce. Inert without STRIPE_SECRET_KEY, and the routes say so rather
+    // than 404ing, so a site owner can tell "not set up" from "not deployed".
+    '/api/checkout': {
+      POST: createCheckoutHandler() as AnyHandler,
+      OPTIONS: createCheckoutOptionsHandler() as AnyHandler,
+    },
+    '/api/stripe-webhook': { POST: createStripeWebhookHandler() as AnyHandler },
+    '/api/products': { POST: createProductsHandler() as AnyHandler },
+    '/api/portal': {
+      POST: createPortalHandler() as AnyHandler,
+      OPTIONS: createPortalOptionsHandler() as AnyHandler,
+    },
+
+    // Customer accounts: the owner's decisions in, and the four a visitor uses.
+    '/api/accounts': { POST: createAccountsHandler() as AnyHandler },
+    '/api/account/request': {
+      POST: createAccountRequestHandler() as AnyHandler,
+      OPTIONS: createAccountOptionsHandler() as AnyHandler,
+    },
+    '/api/account/verify': {
+      GET: createAccountVerifyHandler() as AnyHandler,
+      POST: createAccountVerifyHandler() as AnyHandler,
+      OPTIONS: createAccountOptionsHandler() as AnyHandler,
+    },
+    '/api/account/signout': {
+      POST: createAccountSignOutHandler() as AnyHandler,
+      OPTIONS: createAccountOptionsHandler() as AnyHandler,
+    },
+    '/api/account/me': {
+      GET: createAccountMeHandler() as AnyHandler,
+      POST: createAccountMeHandler() as AnyHandler,
+      OPTIONS: createAccountOptionsHandler() as AnyHandler,
+    },
+    '/api/account/orders': {
+      GET: createAccountOrdersHandler() as AnyHandler,
+      OPTIONS: createAccountOptionsHandler() as AnyHandler,
+    },
   };
+
+  /*
+   * update-page's handler, one per (site address, WordPress origin).
+   *
+   * The default transform needs both, and both are bindings, which a Worker
+   * only sees per request — so the handler cannot be built with the others
+   * above. It was built per request instead, and update-page's rate limiter
+   * lives in its handler: every request met a fresh, empty limiter, so this
+   * front door had none (fifteen pushes from one address, fifteen 200s; the
+   * same site on Pages answers the eleventh with 429 — review of
+   * 2026-09-28). Kept here, it lasts as long as the isolate, as on Pages.
+   *
+   * Keyed rather than single, so a binding that changes is never served by a
+   * transform built for the old one; bounded, because the key includes the
+   * request's own origin when ALLOWED_ORIGIN is unset.
+   */
+  const updatePageHandlers = new Map<string, AnyHandler>();
+  const updatePageHandlerFor = (siteUrl: string, wpOrigin: string): AnyHandler => {
+    const key = `${siteUrl}\n${wpOrigin}`;
+    let handler = updatePageHandlers.get(key);
+    if (!handler) {
+      if (updatePageHandlers.size >= 8) updatePageHandlers.delete(updatePageHandlers.keys().next().value as string);
+      handler = createUpdatePageHandler({
+        ...config.updatePage,
+        transform: config.updatePage?.transform ?? createDefaultTransform({ siteUrl, wpOrigin }),
+      }) as AnyHandler;
+      updatePageHandlers.set(key, handler);
+    }
+    return handler;
+  };
+  const updatePageOptions = createUpdatePageOptionsHandler() as AnyHandler;
 
   return {
     async fetch(request: Request, env: WorkerEnv, ctx: ExecutionContext): Promise<Response> {
@@ -157,26 +265,12 @@ export function createWorker(config: SiteConfig = {}): ExportedHandler<WorkerEnv
       const serveAsset = () => env.ASSETS.fetch(request);
 
       if (url.pathname === '/api/update-page') {
-        /*
-         * Built per request rather than once, because the transform needs the
-         * site's own address and the origin it syncs from, and both are
-         * bindings. A Worker built at module scope would capture whatever the
-         * first isolate happened to see.
-         */
         const handler =
           request.method === 'OPTIONS'
-            ? createUpdatePageOptionsHandler()
-            : createUpdatePageHandler({
-                ...config.updatePage,
-                transform:
-                  config.updatePage?.transform ??
-                  createDefaultTransform({
-                    siteUrl: env.ALLOWED_ORIGIN || url.origin,
-                    wpOrigin: env.WP_SOURCE || '',
-                  }),
-              });
+            ? updatePageOptions
+            : updatePageHandlerFor(primaryOrigin(env.ALLOWED_ORIGIN) || url.origin, env.WP_SOURCE || '');
 
-        return (handler as AnyHandler)(asContext(request, env, ctx, serveAsset));
+        return handler(asContext(request, env, ctx, serveAsset));
       }
 
       const route = routes[url.pathname];

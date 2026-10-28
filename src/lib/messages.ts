@@ -18,7 +18,13 @@ export type MessageKey =
   | 'rateLimited'
   | 'genericError'
   | 'postRefMissing'
-  | 'slugRequired';
+  | 'slugRequired'
+  // The generic form endpoint. Split from `genericError` because these say
+  // what the visitor can do about it — shorten an answer, reload a page —
+  // and "something went wrong" says nothing of the kind.
+  | 'formInvalid'
+  | 'fieldTooLong'
+  | 'tooLarge';
 
 /**
  * Resolve a key (optionally interpolating values) to display text.
@@ -77,6 +83,9 @@ const DEFAULTS: Record<MessageKey, string> = {
   genericError: 'Something went wrong. Please try again.',
   postRefMissing: 'Could not determine which post this refers to.',
   slugRequired: 'A post reference is required.',
+  formInvalid: 'This form could not be sent. Please reload the page and try again.',
+  fieldTooLong: 'One of your answers is too long. Please shorten it and try again.',
+  tooLarge: 'This submission is too large to send. Please shorten it and try again.',
 };
 
 /**

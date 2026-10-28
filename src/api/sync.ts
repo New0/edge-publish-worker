@@ -13,21 +13,20 @@
  * 59% identical. A site supplies its own registry.
  */
 
-import { authenticate } from '../lib/auth.js';
+import { authenticateSync, nonceChecker, refusal } from '../lib/auth.js';
 import { corsHeaders, getResponseOrigin } from '../lib/cors.js';
+import { cutoffFor, sinceFor, type SyncTypeConfig } from '../lib/sync-types.js';
 
 export interface SyncEnv {
   DB: D1Database;
   SYNC_SECRET: string;
   ALLOWED_ORIGIN: string;
   PAGES_PROJECT?: string;
+  /** '2' refuses a request signed v1 only; unset or anything else accepts it, logged (2026-09-29). */
+  SIGNATURE_MIN_VERSION?: string;
 }
 
-/** One drainable record type: which table, and which column carries its timestamp. */
-export interface SyncTypeConfig {
-  table: string;
-  timestampColumn: string;
-}
+export type { SyncTypeConfig } from '../lib/sync-types.js';
 
 export interface SyncOptions {
   /** e.g. `{ contact: { table: 'contact_submissions', timestampColumn: 'submitted_at' } }` */
@@ -86,8 +85,25 @@ export function createSyncGetHandler(options: SyncOptions): PagesFunction<SyncEn
     };
     const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers });
 
-    if (!(await authenticate(context.request, context.env.SYNC_SECRET))) {
-      return json({ error: 'Unauthorized' }, 401);
+    /*
+     * A GET carries no body, so the signed string is empty — which is what the
+     * plugin's `Client::get()` signs.
+     *
+     * Since 2026-09-29 the v2 signature also binds the method and the path
+     * with its query, so `?type=` is signed: a captured GET cannot be turned
+     * into a request for another type. A v1-only request still leaves the
+     * query outside the signature, and is accepted (and logged) until
+     * SIGNATURE_MIN_VERSION is 2 — docs/FOLLOW-UPS.md §13.
+     */
+    // Bearer allowed: the drain is one of the three calls the per-site plugins
+    // that predate signing make. The auth layer logs refusals and bearer use.
+    const auth = await authenticateSync(
+      context.request, '', context.env.SYNC_SECRET, nonceChecker(context.env.DB),
+      { allowBearer: true, endpoint: 'sync', minVersion: context.env.SIGNATURE_MIN_VERSION }
+    );
+    if (!auth.ok) {
+      const { body, status } = refusal(auth);
+      return json(body, status);
     }
 
     const url = new URL(context.request.url);
@@ -99,7 +115,11 @@ export function createSyncGetHandler(options: SyncOptions): PagesFunction<SyncEn
       return json({ error: `Invalid type. Must be one of: ${valid.join(', ')}` }, 400);
     }
 
-    const { table, timestampColumn: ts } = options.types[type];
+    const config = options.types[type];
+    const { table, timestampColumn: ts } = config;
+    // In the form this column stores, or the comparison is meaningless.
+    const from = since === null ? null : sinceFor(config, since);
+    if (since !== null && from === null) return json({ error: 'since must be a date or a unix time' }, 400);
 
     try {
       /*
@@ -116,19 +136,19 @@ export function createSyncGetHandler(options: SyncOptions): PagesFunction<SyncEn
        * report, because there the length it returns *is* the page size.
        */
       if (countOnly) {
-        const stmt = since
+        const stmt = from !== null
           ? context.env.DB.prepare(
               `SELECT COUNT(*) AS n FROM ${table} WHERE synced = 0 AND ${ts} > ?`
-            ).bind(since)
+            ).bind(from)
           : context.env.DB.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE synced = 0`);
         const row = await stmt.first<{ n: number }>();
         return json({ type, count: row?.n ?? 0, exact: true });
       }
 
-      const stmt = since
+      const stmt = from !== null
         ? context.env.DB.prepare(
             `SELECT * FROM ${table} WHERE synced = 0 AND ${ts} > ? ORDER BY ${ts} ASC LIMIT ${pageSize}`
-          ).bind(since)
+          ).bind(from)
         : context.env.DB.prepare(
             `SELECT * FROM ${table} WHERE synced = 0 ORDER BY ${ts} ASC LIMIT ${pageSize}`
           );
@@ -155,12 +175,20 @@ export function createSyncPostHandler(options: SyncOptions): PagesFunction<SyncE
     };
     const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers });
 
-    if (!(await authenticate(context.request, context.env.SYNC_SECRET))) {
-      return json({ error: 'Unauthorized' }, 401);
+    // Read once: a signature covers the raw bytes. See update-page.ts.
+    const rawBody = await context.request.text();
+
+    const auth = await authenticateSync(
+      context.request, rawBody, context.env.SYNC_SECRET, nonceChecker(context.env.DB),
+      { allowBearer: true, endpoint: 'sync', minVersion: context.env.SIGNATURE_MIN_VERSION }
+    );
+    if (!auth.ok) {
+      const { body, status } = refusal(auth);
+      return json(body, status);
     }
 
     try {
-      const body = (await context.request.json()) as {
+      const body = JSON.parse(rawBody) as {
         action?: string; type?: string; ids?: number[]; max_age_days?: number;
       };
 
@@ -168,17 +196,21 @@ export function createSyncPostHandler(options: SyncOptions): PagesFunction<SyncE
         // Clamped: a caller must not be able to purge everything by passing 0,
         // nor keep rows forever by passing a huge value.
         const maxAgeDays = Math.max(1, Math.min(body.max_age_days || 30, 365));
-        const cutoff = new Date(Date.now() - maxAgeDays * 86_400_000).toISOString();
+        const cutoffMs = Date.now() - maxAgeDays * 86_400_000;
         let deleted = 0;
         for (const key of valid) {
-          const { table, timestampColumn: ts } = options.types[key];
+          const config: SyncTypeConfig = options.types[key];
+          const { table, timestampColumn: ts } = config;
+          // Each type's own spelling of time: an ISO string compared against
+          // an INTEGER column converts to the year and matches nothing, so a
+          // table whose time is a unix second would never be purged.
           const result = await context.env.DB
             .prepare(`DELETE FROM ${table} WHERE synced = 1 AND ${ts} < ?`)
-            .bind(cutoff)
+            .bind(cutoffFor(config, cutoffMs))
             .run();
           deleted += result.meta.changes || 0;
         }
-        return json({ success: true, action: 'cleanup', deleted, cutoff_date: cutoff });
+        return json({ success: true, action: 'cleanup', deleted, cutoff_date: new Date(cutoffMs).toISOString() });
       }
 
       const { type, ids } = body;

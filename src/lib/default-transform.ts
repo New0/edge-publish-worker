@@ -30,6 +30,8 @@
  * client where to find something a folder of files does not serve.
  */
 
+import { stripSearchActions } from './jsonld.js';
+
 /** Where the page came from, and where it is going to live. */
 export interface DefaultTransformOptions {
   /** The public address of the static site, e.g. `https://example.com`. */
@@ -108,27 +110,92 @@ function stripWordPressArtefacts(html: string): string {
   return html
     .replace(/<link[^>]+rel=["']alternate["'][^>]+type=["']application\/json\+oembed["'][^>]*>/gi, '')
     .replace(/<link[^>]+type=["']text\/xml\+oembed["'][^>]*>/gi, '')
-    .replace(/<script[^>]*>[\s\S]*?window\._wpemojiSettings[\s\S]*?<\/script>/gi, '')
+    /*
+     * One <script> element at a time, then judged. This was a single
+     * expression, `<script[^>]*>[\s\S]*?window\._wpemojiSettings…</script>`,
+     * whose lazy middle starts at the *first* script on the page and runs to
+     * the emoji one. That was harmless while WordPress printed the emoji
+     * loader first in <head>. Current WordPress prints it last, in the footer,
+     * as a JSON `wp-emoji-settings` block plus a module — so the expression
+     * matched from the import map in <head> to the end of the body, and every
+     * pushed page lost `<main>` and everything in it. Found 2026-09-19 by the
+     * asset-version pair test, on a page captured from WordPress 7.1.
+     */
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, (element) =>
+      /id=["']wp-emoji-settings["']|_wpemojiSettings|wp-emoji-(?:release|loader)/.test(element) ? '' : element)
     .replace(/<style[^>]*>\s*img\.wp-smiley[\s\S]*?<\/style>/gi, '');
 }
 
 /**
- * Replace the origin, in both spellings it occurs in.
+ * What may follow the origin's host for it to be the origin and not a longer
+ * name that starts the same way: not another host character, not a dot that
+ * begins another label, not a port. `ia.example.com.evil.test`,
+ * `ia.example.community` and `ia.example.com:8443` are other hosts; the
+ * origin followed by `/`, `\/`, `%2F`, a quote or a sentence's full stop is
+ * the origin.
+ *
+ * There was no bound until 2026-09-26: the pattern was the bare origin, so
+ * `https://ia.example.com.evil.test/` became `https://example.com.evil.test/`.
+ */
+const HOST_END = '(?![A-Za-z0-9_-]|\\.[A-Za-z0-9_-]|:\\d|%3[Aa]\\d)';
+
+/** A pattern for percent-encoded text, with the escapes' hex matched in either case. */
+const percentPattern = (encoded: string): string =>
+  escapeRegExp(encoded).replace(/%([0-9A-F])([0-9A-F])/g, (_all, a: string, b: string) =>
+    `%${/[A-F]/.test(a) ? `[${a}${a.toLowerCase()}]` : a}${/[A-F]/.test(b) ? `[${b}${b.toLowerCase()}]` : b}`);
+
+/**
+ * Replace the origin, in every spelling it occurs in.
  *
  * Plain, and JSON-escaped inside structured data — which is how Yoast and Rank
  * Math write their `@graph`. The escaped form is the one that has shipped to
  * production twice with the origin still in it, because a page can look
  * completely clean while its JSON-LD still names the private host.
+ *
+ * Three more since 2026-09-26, found by a read-only SEO review of the live
+ * edges, each in all three of those forms:
+ *
+ *  - **percent-encoded** — `https%3A%2F%2Fia.example.com`, as share links
+ *    and oEmbed parameters carry it. Percent escapes are case-insensitive, so
+ *    `%3a%2f%2f` is the same text. The engine's site-transform helper
+ *    (`replaceOrigin` in src/transforms/builtin.mjs) already handled it;
+ *  - **the other scheme** — `http://` when the origin is `https://`, and the
+ *    reverse. Old content written before a site moved to TLS keeps the old
+ *    scheme in every link it has; it names the same host;
+ *  - **protocol-relative** — `//ia.example.com`, which becomes the site's
+ *    address without a scheme, so it stays protocol-relative.
+ *
+ * One expression, one pass, each match replaced in kind so the surrounding
+ * syntax stays valid. One pass matters: separate passes re-read their own
+ * output, and where the site's address continues the origin's
+ * (`https://example.com` → `https://example.com/blog`) a second pass would
+ * rewrite what the first had written.
  */
-function rewriteOrigin(html: string, wpOrigin: string, siteUrl: string): string {
+export function rewriteOrigin(html: string, wpOrigin: string, siteUrl: string): string {
   const from = trimSlash(wpOrigin);
   const to = trimSlash(siteUrl);
   if (!from || from === to) return html;
 
-  const plain = new RegExp(escapeRegExp(from), 'g');
-  const escaped = new RegExp(escapeRegExp(from.replace(/\//g, '\\/')), 'g');
+  // The origin without its scheme: `ia.example.com`, or `example.com/wp` for a
+  // WordPress in a subdirectory.
+  const rest = from.replace(/^(?:https?:)?\/\//i, '');
+  // The site without its scheme, for a protocol-relative match. A site URL
+  // with none (empty, for site-relative output) is the same either way.
+  const bare = /^https?:\/\//i.test(to) ? to.replace(/^https?:/i, '') : to;
 
-  return html.replace(plain, to).replace(escaped, to.replace(/\//g, '\\/'));
+  const pattern = new RegExp(
+    `(?:((https?:)?//${escapeRegExp(rest)})` +
+    `|((https?:)?\\\\/\\\\/${escapeRegExp(rest.replace(/\//g, '\\/'))})` +
+    `|((https?%3[Aa])?%2[Ff]%2[Ff]${percentPattern(encodeURIComponent(rest))}))` +
+    HOST_END,
+    'g'
+  );
+
+  return html.replace(pattern, (_all: string, plain?: string, plainScheme?: string, escaped?: string, escapedScheme?: string, _encoded?: string, encodedScheme?: string) => {
+    if (plain !== undefined) return plainScheme ? to : bare;
+    if (escaped !== undefined) return (escapedScheme ? to : bare).replace(/\//g, '\\/');
+    return encodeURIComponent(encodedScheme ? to : bare);
+  });
 }
 
 /**
@@ -138,18 +205,34 @@ function rewriteOrigin(html: string, wpOrigin: string, siteUrl: string): string 
  * throws on odd input: a page that cannot be improved is returned as it
  * arrived, because a sync that fails closed on one strange page stops a whole
  * site updating.
+ *
+ * **Declines anything that is not HTML** — returns `null`, which `update-page`
+ * records as neither delivered nor failed. The publisher pushes the feed and
+ * the sitemap with every publish, and the default middleware labels every
+ * cached entry `text/html`. Storing an RSS feed or an XML sitemap here would
+ * serve correct bytes under the wrong type: exactly what one site's feed did
+ * until 2026-09-21, found by reconcile, and what a core `/wp-sitemap.xml`
+ * would have done the moment the publisher stopped assuming `/sitemap.xml`.
+ * A site that does want those cached — and serves them with their own type —
+ * brings its own transform.
+ *
+ * A reply with no Content-Type is treated as HTML: WordPress always sends one,
+ * so its absence is an oddity to pass through, not a reason to drop a page.
  */
 export function createDefaultTransform(options: DefaultTransformOptions) {
-  return async (response: Response, spec: { path: string; sourceOrigin: string }): Promise<string> => {
+  return async (response: Response, spec: { path: string; sourceOrigin: string }): Promise<string | null> => {
+    const type = response.headers.get('Content-Type') || '';
+    if (type && !/text\/html/i.test(type)) return null;
+
     const html = await response.text();
 
     // The origin the page actually came from wins over configuration: a page
     // fetched from somewhere else is a page whose links point somewhere else.
     const origin = spec.sourceOrigin || options.wpOrigin;
 
-    return rewriteOrigin(stripWordPressArtefacts(stripDeadLinks(html)), origin, options.siteUrl);
+    return rewriteOrigin(stripSearchActions(stripWordPressArtefacts(stripDeadLinks(html))), origin, options.siteUrl);
   };
 }
 
 /** Exported for tests, and for a site that wants one rule without the others. */
-export const __rules = { stripDeadLinks, stripWordPressArtefacts, rewriteOrigin };
+export const __rules = { stripDeadLinks, stripWordPressArtefacts, rewriteOrigin, stripSearchActions };

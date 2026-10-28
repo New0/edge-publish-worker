@@ -7,7 +7,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "edge-publish-site",
   "main": "src/index.ts",
-  "compatibility_date": "2026-09-10",
+  "compatibility_date": "2026-10-28",
 
   // The static site. Pages are written here by a full build; between builds the
   // plugin pushes individual pages into PAGES_CACHE, which is served first.
@@ -32,7 +32,11 @@
     // plugin pushes. Change it to your domain.
     "ALLOWED_ORIGIN": "https://example.com",
     // Where WordPress lives now. Usually a subdomain of the same site.
-    "WP_SOURCE": "https://ia.example.com"
+    "WP_SOURCE": "https://ia.example.com",
+    // Refuse a request signed the old way (v1), which does not say which
+    // address it was meant for. The plugin has signed the new way since
+    // 2026-09-29; set "1" only for a plugin older than that.
+    "SIGNATURE_MIN_VERSION": "2"
   },
 
   "observability": { "enabled": true }

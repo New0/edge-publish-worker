@@ -6,9 +6,25 @@
 # came from your WordPress and not from someone else.
 SYNC_SECRET="change-me-to-a-long-random-string"
 
-# Only if WordPress is behind HTTP Basic Auth, which is the recommended way to
-# keep the origin private. Base64 of "user:password".
+# Only if your WordPress is sealed with HTTP Basic Auth at the web server.
+# Base64 of "user:password". The recommended way to keep the origin private is
+# the edge-origin-guard mu-plugin, which admits this deployment by its
+# signature (SYNC_SECRET above) and needs nothing here.
 WP_BASIC_AUTH=""
 
-# Only if your forms use a Turnstile widget. Leave empty and Turnstile is off.
+# Only if your forms use a Turnstile widget, or you let customers sign in and
+# want the sign-in form behind one. Leave empty and Turnstile is off.
 TURNSTILE_SECRET_KEY=""
+
+# Only if your customers sign in and you want this edge to send their sign-in
+# link through your own Brevo account. MAIL_FROM is "Site name <noreply@your-domain>",
+# on a domain Brevo has verified. Leave both empty and WordPress sends the link.
+MAIL_FROM=""
+BREVO_API_KEY=""
+
+# Selling something (docs/STRIPE-COMMERCE.md)? A restricted Stripe key with
+# Products, Prices and Checkout Sessions write, and the signing secret of the
+# webhook endpoint you point at /api/stripe-webhook. Leave both empty and every
+# commerce route answers "this site does not sell anything yet".
+STRIPE_SECRET_KEY=""
+STRIPE_WEBHOOK_SECRET=""
