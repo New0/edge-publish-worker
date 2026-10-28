@@ -5,8 +5,7 @@
  * index and, on request, rebuilds the sitemap into PAGES_CACHE where
  * _middleware serves it.
  *
- * Authenticated by signature, falling back to a bearer token for the per-site
- * plugins that predate signing. See the `ews-sync-protocol` skill.
+ * Authenticated by signature only. See the `ews-sync-protocol` skill.
  */
 
 import { authenticateSync, nonceChecker, refusal } from '../lib/auth.js';
@@ -346,11 +345,10 @@ export function createUpdateIndexHandler(): PagesFunction<UpdateIndexEnv> {
     // consumed once. See the same note in update-page.ts.
     const rawBody = await context.request.text();
 
-    // Bearer allowed for the per-site plugins that predate signing; the auth
-    // layer logs refusals, and every request that still uses one.
+    // Signed only (bearer refused since 2026-10-29). The auth layer logs refusals.
     const auth = await authenticateSync(
       context.request, rawBody, context.env.SYNC_SECRET, nonceChecker(context.env.DB),
-      { allowBearer: true, endpoint: 'update-index', minVersion: context.env.SIGNATURE_MIN_VERSION }
+      { endpoint: 'update-index', minVersion: context.env.SIGNATURE_MIN_VERSION }
     );
     if (!auth.ok) {
       const { body, status } = refusal(auth);

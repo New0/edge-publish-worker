@@ -1,19 +1,17 @@
 /**
- * Authentication for the sync endpoints.
+ * Authentication for the sync endpoints: a signed request, and nothing else.
  *
- * Two schemes, and the order matters. A **signed request** proves possession of
- * the shared secret without putting it on the wire, and a timestamp and nonce
- * make a captured request useless within five minutes. A **bearer token** sends
- * the secret itself, in every request, where anything that logs a header keeps
- * it forever — a proxy, an error reporter, a browser extension.
+ * A **signed request** proves possession of the shared secret without putting
+ * it on the wire, and a timestamp and nonce make a captured request useless
+ * within five minutes. A **bearer token** sends the secret itself, in every
+ * request, where anything that logs a header keeps it forever — a proxy, an
+ * error reporter, a browser extension.
  *
- * So signatures are checked first, and the bearer path remains for one reason:
- * two production sites ran per-site plugins that predate it, and breaking their
- * publishing to tidy this up would be choosing our preference over their site.
- * It remains **only where those plugins called** — `sync`, `update-page`,
- * `update-index`, each passing `allowBearer` — and every request that uses it
- * is logged, so the owner can see when nothing sends one any more. New work
- * signs. `docs/FOLLOW-UPS.md` carries the removal.
+ * Until 2026-10-29 `sync`, `update-page` and `update-index` still accepted
+ * one (`allowBearer`), for the per-site plugins that predated signing. Those
+ * plugins are gone from every origin, nothing in this repository or either
+ * site sends one, and the fallback was removed. A request that offers one is
+ * refused and logged as `bearer-not-accepted`, so a forgotten sender says so.
  */
 
 import { verifySignature, seenNonceInD1, NO_NONCE_STORE, SIGNATURE_V2_HEADER, type SignatureResult } from './signature.js';
@@ -52,32 +50,20 @@ export async function secureCompare(a: string, b: string): Promise<boolean> {
   return result === 0;
 }
 
-/** Authenticate a request via `Authorization: Bearer <secret>`. */
-export async function authenticate(request: Request, secret: string): Promise<boolean> {
-  if (!secret) return false; // an unset binding must never authenticate
-  const authHeader = request.headers.get('Authorization');
-  if (!authHeader) return false;
-  const [scheme, token] = authHeader.split(' ');
-  if (scheme !== 'Bearer' || !token) return false;
-  return secureCompare(token, secret);
-}
-
-/** How a request proved itself, for a log and for the deprecation. */
-export type AuthMethod = 'signature' | 'bearer' | null;
+/** How a request proved itself. */
+export type AuthMethod = 'signature' | null;
 
 /**
  * Why a request was refused. For a log, never a response body.
  *
- * `bearer-not-accepted`      a bearer token, at an endpoint that takes only
- *                            signatures (see `allowBearer`).
- * `bad-bearer`               a bearer token that is not the secret.
+ * `bearer-not-accepted`      an `Authorization` header and no signature. No
+ *                            endpoint takes a bearer token since 2026-10-29.
  * `nonce-store-unavailable`  the nonce store is bound and failed — a missing
  *                            `ews_nonces` table, a D1 outage. Answered 503.
  */
 export type AuthRefusal =
   | NonNullable<SignatureResult['reason']>
   | 'bearer-not-accepted'
-  | 'bad-bearer'
   | 'nonce-store-unavailable';
 
 export interface AuthResult {
@@ -98,17 +84,6 @@ export interface AuthResult {
 }
 
 export interface AuthOptions {
-  /**
-   * Accept `Authorization: Bearer <secret>` when no signature is offered.
-   *
-   * Off unless an endpoint asks for it. The fallback exists for per-site
-   * plugins that predate signing, and those only ever called `sync`,
-   * `update-page` and `update-index`. Until 2026-09-28 it was on everywhere,
-   * so `/api/accounts` (erasing customers) and `/api/products` (writing the
-   * Stripe catalogue) accepted the replayable header too, though nothing that
-   * sends one ever called them.
-   */
-  allowBearer?: boolean;
   /** The tag on this endpoint's log lines, e.g. `update-page`. Defaults to the path. */
   endpoint?: string;
   /**
@@ -147,7 +122,7 @@ function logRefusal(request: Request, options: AuthOptions, reason: AuthRefusal)
     reason === 'no-nonce-store'
       ? ' — this deployment has no D1 binding named DB, where signature nonces are recorded, so every signed request is refused. Bind the site\'s D1 as DB.'
       : reason === 'bearer-not-accepted'
-        ? ' — this endpoint takes only signed requests.'
+        ? ' — the sync endpoints take only signed requests since 2026-10-29; a sender still using a bearer token predates signing and must be updated.'
         : reason === 'v1-refused'
           ? ' — signed with the secret, but v1 only, and SIGNATURE_MIN_VERSION is 2. The sender predates v2 and must be updated.'
           : '';
@@ -155,17 +130,12 @@ function logRefusal(request: Request, options: AuthOptions, reason: AuthRefusal)
 }
 
 /**
- * Authenticate a sync request by signature, or — where the endpoint allows it
- * — a bearer token.
+ * Authenticate a sync request by its signature.
  *
  * The raw body is passed in rather than read here, because a `Request` body can
  * only be read once and the handler needs it too — and reading it twice is the
  * bug that presents as a wrong secret.
  *
- * A request carrying signature headers is judged as a signature and never
- * falls back: an invalid signature with a valid bearer beside it is somebody
- * getting the signing wrong, or somebody probing, and quietly accepting it
- * would mean the upgrade never actually happened.
  *
  * Refusals are logged here, with the endpoint and the caller's address, so
  * every endpoint says the same thing the same way. A nonce store that throws
@@ -204,7 +174,7 @@ export async function authenticateSync(
     }
     if (!result.ok) return refuse(result.reason ?? 'bad-signature');
     if (result.version === 1) {
-      // Said every time, like the bearer fallback below, so the owner can see
+      // Said every time, so the owner can see
       // when the last v1-only signer has moved and SIGNATURE_MIN_VERSION can
       // be set to 2. The endpoint and the caller, never the signature.
       console.warn(
@@ -217,17 +187,9 @@ export async function authenticateSync(
 
   // Nothing offered: anyone at all, and not worth a log line each.
   if (!request.headers.get('Authorization')) return { ok: false, method: null, status: 401 };
-  if (!options.allowBearer) return refuse('bearer-not-accepted');
-
-  if (!(await authenticate(request, secret))) return refuse('bad-bearer');
-
-  // Said every time, so the owner can see when nothing sends one any more and
-  // the fallback can go (docs/FOLLOW-UPS.md). The endpoint, never the token.
-  console.warn(
-    `[${tagOf(request, options)}] authenticated by bearer token, not a signature: ${caller(request)}. ` +
-      'Only a plugin that predates signing sends one.'
-  );
-  return { ok: true, method: 'bearer' };
+  // A bearer token, or anything else in Authorization: refused, and said, so
+  // a sender left over from before signing is visible rather than silent.
+  return refuse('bearer-not-accepted');
 }
 
 /**
@@ -242,10 +204,9 @@ export async function authenticateSync(
  * attack. That matches how an unset `SYNC_SECRET` is treated one function up —
  * an unconfigured deployment authenticates nobody.
  *
- * A site whose edge genuinely has no D1 therefore keeps working on the bearer
- * path (where its endpoint allows one) and cannot use signatures, which is the
- * honest pairing: the nonce store *is* half of what a signature buys over a
- * bearer token.
+ * A site whose edge genuinely has no D1 therefore cannot authenticate sync
+ * requests at all: the nonce store *is* half of what a signature buys over a
+ * bearer token, and since 2026-10-29 there is no bearer path to fall back on.
  */
 export function nonceChecker(db: D1Database | undefined): (nonce: string) => Promise<boolean | typeof NO_NONCE_STORE> {
   if (!db) return async () => NO_NONCE_STORE;

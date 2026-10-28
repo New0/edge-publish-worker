@@ -95,11 +95,10 @@ export function createSyncGetHandler(options: SyncOptions): PagesFunction<SyncEn
      * query outside the signature, and is accepted (and logged) until
      * SIGNATURE_MIN_VERSION is 2 — docs/FOLLOW-UPS.md §13.
      */
-    // Bearer allowed: the drain is one of the three calls the per-site plugins
-    // that predate signing make. The auth layer logs refusals and bearer use.
+    // Signed only (bearer refused since 2026-10-29). The auth layer logs refusals.
     const auth = await authenticateSync(
       context.request, '', context.env.SYNC_SECRET, nonceChecker(context.env.DB),
-      { allowBearer: true, endpoint: 'sync', minVersion: context.env.SIGNATURE_MIN_VERSION }
+      { endpoint: 'sync', minVersion: context.env.SIGNATURE_MIN_VERSION }
     );
     if (!auth.ok) {
       const { body, status } = refusal(auth);
@@ -180,7 +179,7 @@ export function createSyncPostHandler(options: SyncOptions): PagesFunction<SyncE
 
     const auth = await authenticateSync(
       context.request, rawBody, context.env.SYNC_SECRET, nonceChecker(context.env.DB),
-      { allowBearer: true, endpoint: 'sync', minVersion: context.env.SIGNATURE_MIN_VERSION }
+      { endpoint: 'sync', minVersion: context.env.SIGNATURE_MIN_VERSION }
     );
     if (!auth.ok) {
       const { body, status } = refusal(auth);

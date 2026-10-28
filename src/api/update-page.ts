@@ -539,13 +539,12 @@ export function createUpdatePageHandler(options: UpdatePageOptions): PagesFuncti
     // .json(), which would throw here and read as a wrong secret.
     const rawBody = await context.request.text();
 
-    // Bearer allowed: update-page is one of the three calls the per-site
-    // plugins that predate signing make. The reason for a refusal goes to the
-    // log (the auth layer writes it), never to the caller: naming the failed
-    // check tells whoever is guessing how to make progress.
+    // Signed only (bearer refused since 2026-10-29). The reason for a refusal
+    // goes to the log (the auth layer writes it), never to the caller: naming
+    // the failed check tells whoever is guessing how to make progress.
     const auth = await authenticateSync(
       context.request, rawBody, context.env.SYNC_SECRET, nonceChecker(context.env.DB),
-      { allowBearer: true, endpoint: 'update-page', minVersion: context.env.SIGNATURE_MIN_VERSION }
+      { endpoint: 'update-page', minVersion: context.env.SIGNATURE_MIN_VERSION }
     );
     if (!auth.ok) {
       const { body, status } = refusal(auth);
